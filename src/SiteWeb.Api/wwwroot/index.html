@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SiteWeb Dashboard</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main>
+    <h1>Dashboard real-time</h1>
+    <kpi-card title="Prenotazioni" value="0"></kpi-card>
+    <kpi-card title="Ordini" value="0"></kpi-card>
+    <section>
+      <button id="connect">Connetti</button>
+      <button id="disconnect">Disconnetti</button>
+      <p id="status">Stato: offline</p>
+    </section>
+  </main>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/7.0.14/signalr.min.js" defer></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
