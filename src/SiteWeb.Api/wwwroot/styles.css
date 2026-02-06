@@ -1,0 +1,21 @@
+:root {
+  --kpi-bg: #0f172a;
+  --kpi-fg: #e2e8f0;
+  --kpi-accent: #38bdf8;
+}
+
+body {
+  font-family: system-ui, sans-serif;
+  margin: 2rem;
+  background: #f8fafc;
+}
+
+main {
+  display: grid;
+  gap: 1.5rem;
+  max-width: 900px;
+}
+
+kpi-card {
+  display: block;
+}
