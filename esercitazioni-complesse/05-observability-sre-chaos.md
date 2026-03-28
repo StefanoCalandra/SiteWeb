@@ -29,13 +29,18 @@ Costruire osservabilità completa (logs, metrics, traces) e validare resilienza 
 
 ## Svolgimento guidato (con commenti)
 
-### 1) OpenTelemetry end-to-end
+### 1) OpenTelemetry end-to-end (traces + metrics + logs)
 
 ```csharp
 builder.Services.AddOpenTelemetry()
-    .ConfigureResource(r => r.AddService("SiteWeb.Api"))
+    .ConfigureResource(resource => resource
+        .AddService(serviceName: "SiteWeb.Api", serviceVersion: "1.0.0"))
     .WithTracing(tracing => tracing
-        .AddAspNetCoreInstrumentation()
+        .AddAspNetCoreInstrumentation(options =>
+        {
+            options.RecordException = true;
+            options.Filter = ctx => !ctx.Request.Path.StartsWithSegments("/health");
+        })
         .AddHttpClientInstrumentation()
         .AddEntityFrameworkCoreInstrumentation()
         .AddSource("SiteWeb.Business")
@@ -44,92 +49,158 @@ builder.Services.AddOpenTelemetry()
         .AddAspNetCoreInstrumentation()
         .AddHttpClientInstrumentation()
         .AddRuntimeInstrumentation()
+        .AddProcessInstrumentation()
         .AddOtlpExporter());
 ```
 
-**Commento:** tracing senza propagazione `traceparent` su chiamate esterne spezza la visibilità end-to-end.
+**Commento:** escludere endpoint rumorosi (es. `/health`) aiuta a ridurre cardinalità inutile.
 
 ---
 
-### 2) Definizione SLI/SLO e error budget
+### 2) Correlation ID e structured logging obbligatori
+
+```csharp
+app.Use(async (ctx, next) =>
+{
+    var correlationId = ctx.Request.Headers["X-Correlation-Id"].FirstOrDefault()
+                        ?? Guid.NewGuid().ToString("N");
+
+    ctx.Response.Headers["X-Correlation-Id"] = correlationId;
+    ctx.Items["CorrelationId"] = correlationId;
+
+    using (LogContext.PushProperty("CorrelationId", correlationId))
+    {
+        await next();
+    }
+});
+```
+
+Campi minimi log applicativi:
+- `timestamp_utc`
+- `level`
+- `service`
+- `tenant_id`
+- `user_id` (se disponibile)
+- `correlation_id`
+- `trace_id`
+- `span_id`
+- `event_name`
+- `error_code`
+
+**Commento:** senza correlazione uniforme, incident response perde minuti preziosi.
+
+---
+
+### 3) Definizione SLI/SLO e burn-rate
 
 SLI minimi:
 - Availability API = richieste `2xx/3xx` su totale.
 - Latency API = p95 endpoint critici.
 - Freshness eventi = tempo tra evento generato e consumato.
 
-SLO esempio (30 giorni):
+SLO esempio (finestra 30 giorni):
 - Availability: **99.9%**
 - p95 `/orders/*`: **< 250ms**
 - Event lag outbox: **< 60s**
 
-Error budget:
-- Budget mensile = `100% - SLO`.
-- Se budget consumato > 50%, freeze feature non critiche.
-- Se budget consumato > 100%, solo lavori di affidabilità.
+Burn-rate policy:
+- burn-rate > 2x (5 minuti): alert warning.
+- burn-rate > 6x (15 minuti): alert critical + incident.
 
-**Commento:** SLO senza policy di conseguenza resta un KPI “decorativo”.
+**Commento:** la combinazione finestre corte + lunghe riduce falsi positivi e ritardi rilevazione.
 
 ---
 
-### 3) Alerting actionabile
+### 4) Error budget policy operativa
 
-Regole:
-- un alert = una azione chiara;
-- niente alert “rumorosi” senza owner;
-- severità legata all’impatto utente.
+Regole consigliate:
+- consumo budget < 25%: delivery normale;
+- 25-50%: review preventiva delle release;
+- 50-100%: freeze feature non critiche;
+- >100%: solo reliability work fino a recovery.
+
+Checklist review quando budget alto:
+- regressioni recenti post deploy;
+- endpoint/tenant maggiormente impattati;
+- azioni di mitigazione entro 24h.
+
+**Commento:** il budget deve guidare priorità prodotto/ingegneria, non solo monitoraggio.
+
+---
+
+### 5) Alerting actionabile con runbook
 
 Template alert:
 - Nome: `api-latency-p95-breach`
 - Condizione: p95 > 250ms per 10m
+- Severità: High
 - Owner: Team API
-- Runbook: link procedura diagnosi
-- Escalation: on-call primaria -> secondaria
+- Runbook: link obbligatorio
+- Escalation: on-call primaria -> secondaria -> incident commander
 
-**Commento:** riduci alert fatigue con tuning continuo e deduplicazione.
+Runbook minimo:
+1. Verifica impatto utente (errori, latenza, tenant colpiti).
+2. Controlla ultimi deploy/config changes.
+3. Isola componente sospetto (DB, cache, broker, downstream).
+4. Applica mitigazione standard (scale out, rollback, feature flag).
+5. Conferma recovery su SLI per 15m.
+
+**Commento:** un alert senza runbook è lavoro incompleto.
 
 ---
 
-### 4) Dashboard golden signals
+### 6) Dashboard golden signals + business signals
 
 Pannelli minimi:
 - **Latency** (p50/p95/p99)
 - **Traffic** (RPS, endpoint top)
-- **Errors** (5xx rate, error classes)
+- **Errors** (5xx, timeout, auth failures)
 - **Saturation** (CPU, memory, thread pool, connessioni DB)
-- **Business KPI** (ordini completati/min)
+- **Business KPI** (ordini completati/min, conversion rate)
 
-**Commento:** aggiungi sempre correlazione deploy-marker per vedere regressioni dopo release.
+Aggiunte utili:
+- marker deploy/release;
+- segmentazione per tenant;
+- top error fingerprints.
+
+**Commento:** dashboard tecnica senza KPI business rende difficile priorizzare incidenti.
 
 ---
 
-### 5) Chaos engineering controllato
+### 7) Chaos engineering controllato (hypothesis-driven)
 
-Esempi esperimenti:
+Formato esperimento:
+- **Ipotesi**: “Con +500ms DB latency, p95 resta < 400ms grazie a cache + fallback”.
+- **Blocco test**: staging/prod canary.
+- **Blast radius**: max 5% traffico.
+- **Stop condition**: error rate > 2% per 3m.
+- **Learning outcome**: decisioni concrete su config/codice/runbook.
+
+Esempi:
 1. Latency injection +500ms su DB per 5 minuti.
 2. Drop 20% chiamate verso servizio pagamenti.
 3. Kill pod random del dispatcher outbox.
 
-Guardrail:
-- ambiente staging o prod canary controllato;
-- blast radius limitato;
-- criterio di stop immediato;
-- finestra temporale concordata on-call.
-
-**Commento:** chaos senza ipotesi misurabile è solo “rottura”, non apprendimento.
+**Commento:** chaos utile solo se produce azioni migliorative tracciabili.
 
 ---
 
-### 6) Postmortem blameless
+### 8) Incident drill e postmortem blameless
 
-Struttura minima:
-- Timeline UTC evento/incidente.
-- Root cause tecnica e sistemica.
-- Cosa ha funzionato / non funzionato.
-- Azioni correttive con owner e data.
-- Follow-up verificato entro sprint successivo.
+Incident drill (mensile):
+- simula incidente realistico;
+- misura MTTD, MTTR, qualità handoff on-call;
+- verifica runbook e alert coverage.
 
-**Commento:** postmortem deve migliorare il sistema, non cercare colpevoli.
+Template postmortem:
+- impatto (utenti/tenant/ricavi)
+- timeline UTC
+- root cause tecnica + sistemica
+- detection gaps
+- azioni correttive (owner + data)
+- verifica efficacia entro sprint successivo
+
+**Commento:** la qualità del postmortem predice miglioramento reale del sistema.
 
 ---
 
@@ -137,21 +208,29 @@ Struttura minima:
 
 ### Test 1 — Tracing coverage
 1. Invoca 10 endpoint core.
-2. Verifica presenza trace complete (ingresso API -> DB -> chiamata esterna).
-3. Target: copertura >90% su rotte critiche.
+2. Verifica trace complete (API -> DB -> downstream).
+3. Target: copertura >90% rotte critiche.
 
-### Test 2 — Alert drill
-1. Simula breach p95 in staging.
-2. Verifica alert ricevuto, runbook seguito, recupero entro obiettivo.
+### Test 2 — Correlation/log quality
+1. Genera errore su endpoint business.
+2. Verifica presenza `correlation_id`, `trace_id`, `tenant_id` nei log.
 
-### Test 3 — Chaos DB latency
-1. Introduci latency controllata su DB.
-2. Misura impatto su p95 e error rate.
-3. Verifica comportamento retry/circuit breaker.
+### Test 3 — Burn-rate alert
+1. Simula aumento errori oltre soglia.
+2. Verifica trigger warning/critical su finestre multiple.
 
-### Test 4 — Error budget policy
-1. Simula consumo budget oltre soglia.
-2. Verifica attivazione gate release.
+### Test 4 — Chaos DB latency
+1. Introduci latency DB controllata.
+2. Verifica impatto e rispetto stop condition.
+3. Registra outcome e azione migliorativa.
+
+### Test 5 — Error budget gate
+1. Porta budget oltre 50%.
+2. Verifica freeze feature e priorità reliability.
+
+### Test 6 — Incident drill
+1. Esegui simulazione end-to-end.
+2. Misura MTTD/MTTR e confronta con baseline.
 
 ---
 
@@ -162,13 +241,14 @@ Struttura minima:
 - `db.client.duration`
 - `outbox.lag.seconds`
 - `slo.burn_rate`
+- `incident.mttd.minutes`
 - `incident.mttr.minutes`
 
 ---
 
 ## Deliverable richiesti
 - Telemetria OTel completa (logs/metrics/traces).
-- SLI/SLO documentati e approvati.
-- Alert + runbook con owner.
-- Chaos plan trimestrale con risultati.
-- Processo postmortem blameless operativo.
+- Catalogo SLI/SLO con ownership.
+- Alert rulebook + runbook associati.
+- Piano chaos trimestrale con esperimenti hypothesis-driven.
+- Processo incident drill + postmortem blameless operativo.
