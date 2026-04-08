@@ -29,22 +29,56 @@ Rendere il sistema anti-fragile usando pattern di resilienza evoluti.
 
 ## Svolgimento guidato (con commenti)
 
-### 1) Timeout budget per catena chiamate
+### 1) Dependency criticality matrix (prima dei pattern)
 
-Regola:
-- timeout totale request = 2s;
-- suddividi budget tra dipendenze (es. payment 800ms, inventory 500ms, shipping 500ms);
-- lascia margine orchestrazione interna.
+Classifica ogni dipendenza:
+- criticità business (alta/media/bassa);
+- timeout tollerabile;
+- idempotenza (sì/no);
+- fallback disponibile (sì/no);
+- retry consentito (sì/no).
 
-**Commento:** timeout assenti o troppo lunghi amplificano saturation e code.
+Esempio:
+- `payments`: criticità alta, timeout 800ms, retry limitato, no hedging.
+- `catalog-read`: criticità media, timeout 300ms, hedging possibile.
+
+**Commento:** senza classificazione iniziale applichi pattern sbagliati al posto sbagliato.
 
 ---
 
-### 2) Circuit breaker dinamico
+### 2) Timeout budget per catena chiamate
+
+Regola:
+- timeout totale request = 2s;
+- budget per dipendenza (payment 800ms, inventory 500ms, shipping 500ms);
+- margine orchestrazione interna ~200ms.
 
 ```csharp
-var pipeline = new ResiliencePipelineBuilder<HttpResponseMessage>()
-    .AddTimeout(TimeSpan.FromMilliseconds(800))
+public static class TimeoutBudgets
+{
+    public static readonly TimeSpan Payment = TimeSpan.FromMilliseconds(800);
+    public static readonly TimeSpan Inventory = TimeSpan.FromMilliseconds(500);
+    public static readonly TimeSpan Shipping = TimeSpan.FromMilliseconds(500);
+}
+```
+
+**Commento:** timeout troppo lunghi saturano thread/socket e peggiorano il tail latency.
+
+---
+
+### 3) Pipeline resilienza per dipendenza (Polly)
+
+```csharp
+var paymentPipeline = new ResiliencePipelineBuilder<HttpResponseMessage>()
+    .AddTimeout(TimeoutBudgets.Payment)
+    .AddRetry(new RetryStrategyOptions<HttpResponseMessage>
+    {
+        MaxRetryAttempts = 2,
+        Delay = TimeSpan.FromMilliseconds(120),
+        BackoffType = DelayBackoffType.Exponential,
+        UseJitter = true,
+        ShouldHandle = args => ValueTask.FromResult(args.Outcome.Exception is HttpRequestException)
+    })
     .AddCircuitBreaker(new CircuitBreakerStrategyOptions<HttpResponseMessage>
     {
         FailureRatio = 0.5,
@@ -55,96 +89,162 @@ var pipeline = new ResiliencePipelineBuilder<HttpResponseMessage>()
     .Build();
 ```
 
-**Commento:** tarare soglie per dipendenza; un solo profilo globale raramente funziona.
+**Commento:** ordine tipico: timeout -> retry -> circuit breaker (valida sul tuo caso d’uso).
 
 ---
 
-### 3) Bulkhead isolation
+### 4) Bulkhead isolation per evitare cascade failure
 
-Esempio:
-- pool connessioni dedicato per servizio pagamenti;
-- limite concorrenza separato per endpoint ad alto costo;
-- code isolate per worker critici.
+```csharp
+var bulkhead = new SemaphoreSlim(initialCount: 50, maxCount: 50); // limite concorrenza dipendenza
 
-**Commento:** bulkhead previene il collasso totale quando una dipendenza degrada.
+public async Task<T> ExecuteWithBulkheadAsync<T>(Func<Task<T>> work)
+{
+    if (!await bulkhead.WaitAsync(TimeSpan.FromMilliseconds(50)))
+        throw new BulkheadRejectedException("Bulkhead saturo");
 
----
-
-### 4) Retry con backoff + jitter (non ovunque)
-
-Linee guida:
-- retry solo su errori transienti;
-- max tentativi contenuti (2-3);
-- backoff esponenziale con jitter;
-- no retry su errori business (4xx non transitori).
-
-**Commento:** retry indiscriminati peggiorano i picchi (retry storm).
-
----
-
-### 5) Fallback semantico e degraded mode
-
-Esempi:
-- catalogo in sola lettura se pricing esterno down;
-- check-out limitato senza promozioni dinamiche;
-- mostra stato “dato temporaneamente non aggiornato”.
-
-**Commento:** degraded mode deve essere esplicito per utente e operazioni.
-
----
-
-### 6) Hedged requests (uso selettivo)
-
-Quando usarle:
-- chiamate idempotenti read-only;
-- elevata tail latency (p99 molto alta);
-- capacità backend sufficiente.
-
-Quando evitarle:
-- operazioni con side effect;
-- sistemi già saturi.
-
-**Commento:** hedging riduce latenza tail ma aumenta carico complessivo.
-
----
-
-### 7) Adaptive concurrency limits
+    try
+    {
+        return await work();
+    }
+    finally
+    {
+        bulkhead.Release();
+    }
+}
+```
 
 Strategia:
-- misura latenza recente;
-- riduci concorrenza quando latenza cresce oltre soglia;
-- rialza gradualmente in recovery.
+- pool separati per dipendenze critiche;
+- limiti diversi per read/write;
+- queue limitata per evitare accumulo infinito.
 
-**Commento:** limita overload prima che diventi incidente completo.
+**Commento:** bulkhead trasforma fail “totale” in fail “contenuto”.
+
+---
+
+### 5) Retry policy sicure (anti retry-storm)
+
+Regole:
+- retry solo su errori transienti (timeouts, 5xx, network);
+- max tentativi 2-3;
+- exponential backoff + jitter;
+- no retry su 4xx business.
+
+Checklist anti-storm:
+- cap globale retry/sec;
+- metriche su retry amplification;
+- disattivazione rapida via config flag.
+
+**Commento:** retry non governato aumenta il carico proprio quando il sistema è fragile.
+
+---
+
+### 6) Fallback semantico e degraded mode esplicito
+
+Pattern esempi:
+- `pricing down` -> usa ultimo prezzo valido con label “stima”; 
+- `recommendation down` -> risposta senza suggerimenti;
+- `payment score down` -> workflow manual-review.
+
+```csharp
+public async Task<PriceDto> GetPriceAsync(string sku, CancellationToken ct)
+{
+    try
+    {
+        return await _pricingClient.GetLivePriceAsync(sku, ct);
+    }
+    catch
+    {
+        var cached = await _priceCache.GetLastKnownAsync(sku, ct);
+        return new PriceDto(cached.Value, source: "fallback-cache", isDegraded: true);
+    }
+}
+```
+
+**Commento:** fallback deve essere tracciabile (`isDegraded=true`) per osservabilità e UX corretta.
+
+---
+
+### 7) Hedged requests (solo read idempotenti)
+
+Quando usarle:
+- endpoint read-only;
+- elevata tail latency (p99 alta);
+- backend con headroom sufficiente.
+
+Quando evitarle:
+- endpoint write/side effect;
+- backend già saturo.
+
+Esempio logico:
+- invia richiesta primaria;
+- dopo 80ms, se non risposta, invia hedge secondaria;
+- usa la prima risposta valida e cancella l’altra.
+
+**Commento:** hedging migliora p99 ma aumenta QPS; monitorare sempre costo extra.
+
+---
+
+### 8) Adaptive concurrency limits
+
+Strategia:
+- misura EWMA latenza;
+- se latenza supera soglia, riduci limite concorrenza;
+- in recovery, rialza gradualmente;
+- imposta floor/ceiling per evitare oscillazioni.
+
+**Commento:** è una difesa proattiva contro overload, prima che scatti incidente grave.
+
+---
+
+### 9) Game day e runbook resilienza
+
+Game day trimestrale:
+- fault su dipendenza critica;
+- verifica runbook, allerta e comunicazione cross-team;
+- KPI: MTTD, MTTR, error burst peak, user impact.
+
+Runbook minimo:
+1. Identifica dipendenza degradata.
+2. Abilita modalità degradata prevista.
+3. Riduci pressione (throttle/feature flag).
+4. Verifica KPI stabilizzazione.
+5. Chiusura e postmortem.
+
+**Commento:** resilienza senza esercitazione periodica tende a degradare nel tempo.
 
 ---
 
 ## Piano test (obbligatorio)
 
-### Test 1 — Circuit breaker open/close
-1. Simula 50% failure ratio su dipendenza.
-2. Verifica apertura breaker.
-3. Verifica half-open e recovery controllata.
+### Test 1 — Circuit breaker lifecycle
+1. Simula failure ratio >50%.
+2. Verifica transizione closed -> open -> half-open -> closed.
 
-### Test 2 — Timeout budget
-1. Introduci latency crescente su chiamata esterna.
-2. Verifica timeout entro budget e nessuna saturazione thread pool.
+### Test 2 — Timeout budget enforcement
+1. Aumenta latenza dipendenza oltre budget.
+2. Verifica timeout rapido e assenza saturazione thread pool.
 
-### Test 3 — Bulkhead effectiveness
+### Test 3 — Bulkhead containment
 1. Saturare dipendenza non critica.
-2. Verifica che endpoint core restino disponibili.
+2. Verifica che endpoint critici restino disponibili.
 
 ### Test 4 — Retry storm prevention
-1. Fault transiente ad alta frequenza.
-2. Verifica numero retry totale entro limiti previsti.
+1. Introduci fault transiente ad alta frequenza.
+2. Verifica cap retry e assenza amplificazione eccessiva.
 
-### Test 5 — Degraded mode
-1. Downstream servizio pricing indisponibile.
-2. Verifica risposta degradata coerente e tracciata.
+### Test 5 — Degraded mode correctness
+1. Spegni servizio pricing.
+2. Verifica fallback coerente e campo `isDegraded=true`.
 
 ### Test 6 — Hedging trade-off
 1. Abilita hedging su endpoint read-only.
-2. Misura riduzione p99 e aumento carico backend.
+2. Misura riduzione p99 e aumento QPS backend.
+
+### Test 7 — Adaptive concurrency
+1. Simula latenza crescente.
+2. Verifica riduzione automatica concurrency limit e recovery progressiva.
 
 ---
 
@@ -153,15 +253,18 @@ Strategia:
 - `circuit_breaker.open.count`
 - `bulkhead.rejected.count`
 - `retry.attempt.count`
+- `retry.amplification.factor`
 - `fallback.activation.count`
 - `degraded_mode.active`
+- `hedge.request.count`
 - `latency.p95/p99`
 
 ---
 
 ## Deliverable richiesti
+- Dependency criticality matrix per servizi esterni.
 - Policy resilience per ciascuna dipendenza critica.
-- Configurazione timeout/retry/circuit breaker/bulkhead.
+- Config timeout/retry/circuit-breaker/bulkhead con rationale.
 - Degraded mode documentato e testato.
-- Report fault injection con KPI (recovery time, error burst).
-- ADR con trade-off dei pattern applicati.
+- Report fault injection + game day con KPI.
+- ADR finale con trade-off e limiti noti.
